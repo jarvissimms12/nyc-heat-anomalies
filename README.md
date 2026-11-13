@@ -1,7 +1,20 @@
 # NYC Heat & Hot-Water Complaint Anomalies
 
+[![tests](https://github.com/jarvissimms12/nyc-heat-anomalies/actions/workflows/tests.yml/badge.svg)](https://github.com/jarvissimms12/nyc-heat-anomalies/actions/workflows/tests.yml)
+![Python 3.11](https://img.shields.io/badge/python-3.11-blue)
+![SQL](https://img.shields.io/badge/SQL-SQLite-lightgrey)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
 Finding NYC buildings whose heat and hot-water complaints in a heating season are
 far above what their own history predicts, using public NYC 311 data.
+
+**Author:** Jarvis Simms · [LinkedIn](https://www.linkedin.com/in/jarvis-simms-846062136/) · [GitHub](https://github.com/jarvissimms12)
+
+![Observed vs. expected complaint-days, with flagged buildings in red](docs/example_output_simulated.png)
+
+*Example output from the test simulation (2,000 synthetic buildings, 8 with planted
+spikes). Each point is a building. Red points are buildings flagged at a 5% false
+discovery rate. Run the quick start below to produce the same chart from live 311 data.*
 
 **Why it matters:** NYC law requires landlords to provide heat from October 1 to
 May 31. A sudden, lasting rise in a building's complaints can mean a failing
@@ -23,7 +36,7 @@ produces a ranked, uncertainty-aware list of buildings for further review.
 ## Quick start
 
 ```bash
-pip install pandas numpy scipy requests matplotlib pytest
+pip install -r requirements.txt
 
 # 1. Pull four heating seasons (2021-22 through 2024-25)
 python etl.py --start 2021-10-01 --end 2025-06-01 --db heat.db
@@ -37,6 +50,20 @@ pytest -q
 
 Outputs go to `output/`: a score for every building, the flagged subset, and
 an observed-vs-expected chart.
+
+## Project layout
+
+```
+nyc-heat-anomalies/
+├── etl.py                          # extract from SODA API, validate, load to SQLite
+├── analysis.py                     # empirical-Bayes scoring, FDR control, chart
+├── sql/
+│   ├── schema.sql                  # tables + audit log
+│   └── building_season_counts.sql  # complaint-days per building per season
+├── tests/test_pipeline.py          # offline tests on synthetic data
+├── docs/                           # example output
+└── .github/workflows/tests.yml     # runs the tests on every push
+```
 
 ## Key design decisions
 
