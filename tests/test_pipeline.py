@@ -66,11 +66,26 @@ def test_model_finds_planted_anomaly_and_controls_false_positives():
     planted = panel.index[:10]
     panel.loc[planted, 2023] = (lam[:10] * 6 + 15).round().astype(int)   # big spike
 
-    result, _ = analysis.score_buildings(panel, 2023, seasons[:-1])
+    result, _ = analysis.score_buildings(panel, 2023, seasons[:-1], adjust_season=False)
     flagged = set(result.loc[result.q_value < 0.05, "bbl"])
 
     assert set(planted) <= flagged                     # all planted spikes found
     assert len(flagged - set(planted)) / max(len(flagged), 1) < 0.10   # few false discoveries
+
+
+def test_season_multiplier_absorbs_citywide_shock():
+    rng = np.random.default_rng(1)
+    n, seasons = 3_000, [2020, 2021, 2022, 2023]
+    lam = rng.gamma(shape=1.5, scale=2.0, size=n)
+    data = rng.poisson(lam[:, None] * np.array([1, 1, 1, 1.3]), size=(n, len(seasons)))  # +30% citywide
+    panel = pd.DataFrame(data, columns=seasons, index=[f"3{i:09d}" for i in range(n)])
+
+    m = analysis.season_multiplier(panel, 2023, seasons[:-1])
+    assert 1.2 < m < 1.4
+
+    adjusted, _ = analysis.score_buildings(panel, 2023, seasons[:-1], adjust_season=True)
+    unadjusted, _ = analysis.score_buildings(panel, 2023, seasons[:-1], adjust_season=False)
+    assert (adjusted.q_value < 0.05).sum() < (unadjusted.q_value < 0.05).sum()
 
 
 def test_end_to_end_sqlite(tmp_path):

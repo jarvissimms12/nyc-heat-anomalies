@@ -12,14 +12,17 @@ Gamma(alpha, beta) prior. Then:
     (empirical Bayes).
   * Each building's posterior is lambda_i | x ~ Gamma(alpha + sum_t x_it, beta + k).
   * The posterior predictive for the target season is Negative Binomial with
-    r = alpha + sum_t x_it and p = (beta + k) / (beta + k + 1).
+    r = alpha + sum_t x_it and p = (beta + k) / (beta + k + m), where m is a
+    citywide season multiplier that absorbs shocks hitting every building.
 
 The model pulls buildings with only a few complaints toward the citywide rate
 (shrinkage), so a building going from 0 to 2 complaint-days is not treated as
 a "100x increase". Uncertainty is reported as a 90% prediction interval and an
 upper-tail p-value P(X >= observed). Because thousands of buildings are tested
 at once, p-values are adjusted with Benjamini-Hochberg to control the false
-discovery rate.
+discovery rate. A building is flagged only if it is significant AND has at
+least --min-days complaint-days, so the list stays a practical size for review.
+Buildings with no baseline complaints ("new to 311") are reported separately.
 
 Usage:
     python analysis.py --db heat.db --target-season 2024 --baseline-seasons 3 --fdr 0.05
@@ -93,14 +96,31 @@ def benjamini_hochberg(p: np.ndarray) -> np.ndarray:
     return out
 
 
+def season_multiplier(panel: pd.DataFrame, target: int, baseline_seasons: list[int]) -> float:
+    """
+    Citywide change in complaint-days from the average baseline season to the
+    target season (e.g. 1.2 = 20% more citywide). Estimated only on buildings
+    that appear in the baseline, so new buildings don't inflate it.
+    """
+    established = panel[panel[baseline_seasons].sum(axis=1) > 0]
+    per_season_baseline = established[baseline_seasons].to_numpy().sum() / len(baseline_seasons)
+    return float(established[target].sum() / per_season_baseline)
+
+
 def score_buildings(panel: pd.DataFrame, target: int, baseline_seasons: list[int],
-                    interval: float = 0.90) -> tuple[pd.DataFrame, tuple[float, float]]:
+                    interval: float = 0.90, adjust_season: bool = True
+                    ) -> tuple[pd.DataFrame, tuple[float, float]]:
     baseline = panel[baseline_seasons]
     k = len(baseline_seasons)
     alpha, beta = fit_gamma_prior(baseline)
 
+    # If X ~ Poisson(m * lambda) with lambda ~ Gamma(a, b), then X ~ NB(a, b / (b + m)).
+    # m rescales every building's expectation for a citywide shock (e.g. a cold winter).
+    m = season_multiplier(panel, target, baseline_seasons) if adjust_season else 1.0
+    log.info("Citywide season multiplier: %.3f", m)
+
     r = alpha + baseline.sum(axis=1).to_numpy()
-    p = (beta + k) / (beta + k + 1)
+    p = (beta + k) / (beta + k + m)
     observed = panel[target].to_numpy()
 
     predictive = stats.nbinom(r, p)
@@ -117,22 +137,33 @@ def score_buildings(panel: pd.DataFrame, target: int, baseline_seasons: list[int
     })
     result["ratio"] = result["observed"] / result["expected"]
     result["q_value"] = benjamini_hochberg(result["p_value"].to_numpy())
+    # Buildings with no complaints in any baseline season are a different case:
+    # a new problem, a newly built or converted building, or a changed BBL.
+    result["new_to_311"] = result["baseline_total"] == 0
     return result.sort_values("p_value").reset_index(drop=True), (alpha, beta)
 
 
-def plot(result: pd.DataFrame, fdr: float, target: int, out_path: Path) -> None:
-    flagged = result["q_value"] < fdr
+def flag(result: pd.DataFrame, fdr: float, min_days: int) -> pd.Series:
+    """Statistically significant (FDR) AND large enough to be worth an investigator's time."""
+    return (result["q_value"] < fdr) & (result["observed"] >= min_days)
+
+
+def plot(result: pd.DataFrame, fdr: float, min_days: int, target: int, out_path: Path) -> None:
+    result = result[~result["new_to_311"]]
+    flagged = flag(result, fdr, min_days)
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(result.loc[~flagged, "expected"], result.loc[~flagged, "observed"] + 0.5,
                s=6, alpha=0.25, color="#8a8a8a", label="Not flagged")
     ax.scatter(result.loc[flagged, "expected"], result.loc[flagged, "observed"] + 0.5,
-               s=14, alpha=0.9, color="#c0392b", label=f"Flagged (FDR < {fdr:.0%})")
+               s=14, alpha=0.9, color="#c0392b",
+               label=f"Flagged (FDR < {fdr:.0%}, ≥ {min_days} complaint-days)")
     lim = [result["expected"].min() * 0.8, max(result["expected"].max(), result["observed"].max()) * 1.2]
     ax.plot(lim, lim, color="black", lw=0.8, ls="--", label="Observed = expected")
     ax.set(xscale="log", yscale="log",
            xlabel="Expected complaint-days (posterior predictive mean)",
            ylabel="Observed complaint-days (+0.5 for log scale)",
-           title=f"Heat / hot-water complaint-days by building, {target}-{target + 1} season")
+           title=f"Heat / hot-water complaint-days by building, {target}-{target + 1} season\n"
+                 f"(buildings with complaints in the baseline seasons)")
     ax.legend(frameon=False, loc="upper left")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -146,6 +177,9 @@ def main() -> None:
                     help="season start year, e.g. 2024 = Oct 2024 - May 2025")
     ap.add_argument("--baseline-seasons", type=int, default=3)
     ap.add_argument("--fdr", type=float, default=0.05)
+    ap.add_argument("--min-days", type=int, default=10,
+                    help="minimum complaint-days in the target season to be flagged")
+    ap.add_argument("--no-season-adjustment", action="store_true")
     ap.add_argument("--out-dir", default="output")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -160,19 +194,24 @@ def main() -> None:
         raise SystemExit(f"No data for season(s) {sorted(missing)} - widen the ETL date range.")
 
     panel = to_panel(counts, baseline_seasons + [args.target_season])
-    result, (alpha, beta) = score_buildings(panel, args.target_season, baseline_seasons)
+    result, (alpha, beta) = score_buildings(panel, args.target_season, baseline_seasons,
+                                            adjust_season=not args.no_season_adjustment)
     boroughs = counts.groupby("bbl")["borough"].agg(lambda s: s.dropna().mode().iat[0] if s.notna().any() else None)
     result = result.merge(boroughs.rename("borough"), left_on="bbl", right_index=True, how="left")
 
-    flagged = result[result["q_value"] < args.fdr]
+    is_flagged = flag(result, args.fdr, args.min_days)
+    flagged = result[is_flagged & ~result["new_to_311"]]
+    new_flagged = result[is_flagged & result["new_to_311"]]
     log.info("Prior: alpha=%.3f beta=%.3f (citywide mean %.2f complaint-days/season)",
              alpha, beta, alpha / beta)
-    log.info("Buildings scored: %s | flagged at FDR %.0f%%: %s",
-             f"{len(result):,}", args.fdr * 100, f"{len(flagged):,}")
+    log.info("Buildings scored: %s | flagged (FDR %.0f%%, >= %d days): %s with history, %s new to 311",
+             f"{len(result):,}", args.fdr * 100, args.min_days, f"{len(flagged):,}", f"{len(new_flagged):,}")
 
-    result.to_csv(out_dir / f"building_scores_{args.target_season}.csv", index=False)
-    flagged.to_csv(out_dir / f"flagged_buildings_{args.target_season}.csv", index=False)
-    plot(result, args.fdr, args.target_season, out_dir / f"observed_vs_expected_{args.target_season}.png")
+    t = args.target_season
+    result.to_csv(out_dir / f"building_scores_{t}.csv", index=False)
+    flagged.to_csv(out_dir / f"flagged_buildings_{t}.csv", index=False)
+    new_flagged.to_csv(out_dir / f"flagged_new_to_311_{t}.csv", index=False)
+    plot(result, args.fdr, args.min_days, t, out_dir / f"observed_vs_expected_{t}.png")
     log.info("Wrote results to %s/", out_dir)
 
 
